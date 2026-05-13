@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skypaas_agent"
+version = "0.1.0"
+description = "Tenant-side Frappe app: HMAC-verified Login-as-Admin endpoint for SkyEngPro Cloud (ADR-0013)"
+requires-python = ">=3.10"
+authors = [{ name = "SkyEngPro" }]
+license = { text = "AGPL-3.0-only" }
+# No runtime deps beyond Frappe's own (stdlib hmac/hashlib + frappe).
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["skypaas_agent*"]
