@@ -11,11 +11,12 @@ app_name = "skypaas_agent"
 app_title = "SkyEngPro Agent"
 app_publisher = "SkyEngPro"
 app_description = (
-    "Tenant-side companion for SkyEngPro Cloud: HMAC-verified Login-as-Admin endpoint per ADR-0013."
+    "Tenant-side companion for SkyEngPro Cloud: HMAC-verified Login-as-Admin "
+    "endpoint (ADR-0013) + Phase 2 site CRUD endpoints (ADR-0017)."
 )
 app_email = "ops@skyengpro.com"
 app_license = "AGPL-3.0-only"
-app_version = "0.1.0"
+app_version = "0.2.0"
 
 # No DocTypes, no fixtures, no scheduler hooks today. The agent is pure
 # code reachable via /api/method/skypaas_agent.api.*.

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "skypaas_agent"
-version = "0.1.0"
-description = "Tenant-side Frappe app: HMAC-verified Login-as-Admin endpoint for SkyEngPro Cloud (ADR-0013)"
+version = "0.2.0"
+description = "Tenant-side Frappe app: HMAC-verified Login-as-Admin + site CRUD endpoints for SkyEngPro Cloud (ADR-0013, ADR-0017)"
 requires-python = ">=3.10"
 authors = [{ name = "SkyEngPro" }]
 license = { text = "AGPL-3.0-only" }

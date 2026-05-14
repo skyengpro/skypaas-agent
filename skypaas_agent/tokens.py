@@ -1,15 +1,23 @@
-"""HMAC-signed login token, the cryptographic primitive of PR-C.
+"""HMAC-signed tokens — the cryptographic primitive shared by every
+control-plane → agent call.
 
-A token is a short string the SkyEngPro Cloud backend mints when an
-operator clicks "Login as Admin" in the dashboard. It carries:
+Two payload shapes today:
 
-  - the Frappe user to log in as (almost always ``Administrator``)
-  - the target site (so a token minted for tenant A can't unlock tenant B)
-  - an absolute expiry (60 seconds in the future by default)
+  - ``LoginPayload`` (PR-C, shipped 0.1.0) — minted when the operator
+    clicks "Login as Admin". Carries ``{user, site, exp}``. Consumed by
+    ``api.login_via_token`` which calls ``login_manager.login_as``.
 
-The agent on the tenant side verifies the HMAC-SHA256 signature with a
-secret shared between the control plane and that one tenant (per-tenant
-secret, NOT global — compromise of one tenant doesn't bleed across).
+  - ``OperationPayload`` (PR #1A, Phase 2 ADR-0017) — minted when the
+    control plane calls any non-login endpoint on the agent (list
+    sites, create site, backup, etc.). Carries ``{op, site, exp}``.
+    Consumed by ``api.<op_endpoint>`` after verifying that the token's
+    ``op`` matches the endpoint being called.
+
+Both payloads share the same HMAC secret (per-tenant, loaded from
+``site_config.json:skypaas_agent_hmac_secret``) and the same wire
+format. They are NOT interchangeable: a LoginPayload cannot unlock a
+site-CRUD endpoint and vice versa. The verifier checks the payload
+shape against the expected one and rejects mismatches.
 
 Wire format:
 
@@ -43,6 +51,25 @@ class LoginPayload:
         return {"user": self.user, "site": self.site, "exp": self.exp}
 
 
+@dataclass(frozen=True)
+class OperationPayload:
+    """Authorises a single agent operation call.
+
+    `op` is the operation kind (e.g. ``list_sites``, ``create_site``).
+    `site` scopes the call to one Frappe site — even when the operation
+    is bench-wide (``list_sites``), the token still binds to one site
+    so a token minted for tenant A can't unlock the same operation on
+    tenant B's bench if their HMAC secrets ever happen to collide.
+    """
+
+    op: str
+    site: str
+    exp: int  # unix timestamp seconds
+
+    def to_dict(self) -> dict:
+        return {"op": self.op, "site": self.site, "exp": self.exp}
+
+
 def _b64url(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
 
@@ -52,7 +79,7 @@ def _b64url_decode(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + padding)
 
 
-def sign(payload: LoginPayload, secret: bytes) -> str:
+def sign(payload: LoginPayload | OperationPayload, secret: bytes) -> str:
     """Build a wire-format token.
 
     `secret` is the per-tenant HMAC key, expected ≥32 random bytes.
@@ -121,6 +148,79 @@ def verify(
     if payload.site != expected_site:
         raise TokenError(
             "wrong_site", f"token bound to {payload.site!r}, this site is {expected_site!r}"
+        )
+
+    return payload
+
+
+def verify_operation(
+    token: str,
+    secret: bytes,
+    expected_site: str,
+    expected_op: str,
+    *,
+    now: int | None = None,
+) -> OperationPayload:
+    """Validate an operation token.
+
+    Mirrors :func:`verify` but for ``OperationPayload``. Extra check:
+    the payload's ``op`` field must match ``expected_op`` — a token
+    minted for ``op=list_sites`` cannot unlock the ``create_site``
+    endpoint.
+
+    Raises ``TokenError(reason=…)`` with one of the verify() reasons
+    plus:
+
+      - ``"wrong_op"`` : payload.op != expected_op
+      - ``"wrong_shape"`` : payload lacks the OperationPayload fields
+        (e.g. a LoginPayload was passed where an OperationPayload was
+        expected — same wire format, different fields).
+    """
+    if not isinstance(token, str) or token.count(".") != 1:
+        raise TokenError("malformed", "token must be '<payload>.<mac>'")
+    p_b64, mac_hex = token.split(".", 1)
+
+    try:
+        raw = _b64url_decode(p_b64)
+        body = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        raise TokenError("malformed", str(e)) from e
+
+    expected_mac = hmac.new(secret, raw, sha256).hexdigest()
+    if not hmac.compare_digest(mac_hex, expected_mac):
+        raise TokenError("bad_signature")
+
+    if not isinstance(body, dict):
+        raise TokenError("malformed", "payload must be an object")
+
+    # Wrong-shape detection comes BEFORE field reads so a LoginPayload
+    # ({user, site, exp}) is cleanly rejected with reason="wrong_shape"
+    # rather than KeyError-styled "malformed: 'op'".
+    if "op" not in body or "user" in body:
+        raise TokenError(
+            "wrong_shape",
+            "expected OperationPayload {op, site, exp}; got something else",
+        )
+
+    try:
+        payload = OperationPayload(
+            op=str(body["op"]), site=str(body["site"]), exp=int(body["exp"])
+        )
+    except (KeyError, TypeError, ValueError) as e:
+        raise TokenError("malformed", f"missing or wrong-type field: {e}") from e
+
+    now = now if now is not None else int(time.time())
+    if payload.exp <= now:
+        raise TokenError("expired")
+    if payload.exp - now > MAX_TTL_SECONDS:
+        raise TokenError("too_long_ttl")
+    if payload.site != expected_site:
+        raise TokenError(
+            "wrong_site", f"token bound to {payload.site!r}, this site is {expected_site!r}"
+        )
+    if payload.op != expected_op:
+        raise TokenError(
+            "wrong_op", f"token authorises {payload.op!r}, endpoint is {expected_op!r}"
         )
 
     return payload
