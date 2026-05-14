@@ -16,7 +16,7 @@ app_description = (
 )
 app_email = "ops@skyengpro.com"
 app_license = "AGPL-3.0-only"
-app_version = "0.2.0"
+app_version = "0.3.0"
 
 # No DocTypes, no fixtures, no scheduler hooks today. The agent is pure
 # code reachable via /api/method/skypaas_agent.api.*.
