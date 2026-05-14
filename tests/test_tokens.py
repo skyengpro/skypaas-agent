@@ -1,4 +1,4 @@
-"""Unit tests for the HMAC-signed login token primitive."""
+"""Unit tests for the HMAC-signed token primitives."""
 
 from __future__ import annotations
 
@@ -10,9 +10,11 @@ from skypaas_agent.tokens import (
     DEFAULT_TTL_SECONDS,
     MAX_TTL_SECONDS,
     LoginPayload,
+    OperationPayload,
     TokenError,
     sign,
     verify,
+    verify_operation,
 )
 
 # A 32-byte test secret (NOT a real one). Reused across tests for
@@ -145,3 +147,125 @@ class TestSecretIsolation:
         payload = _fresh_payload(site="random-tenant.test")
         token = sign(payload, secret)
         assert verify(token, secret, expected_site=payload.site).user == "Administrator"
+
+
+# ---------- Phase 2 (PR #1A): OperationPayload ----------
+
+
+def _fresh_op_payload(op: str = "list_sites", site: str = "tenant.example.com") -> OperationPayload:
+    return OperationPayload(op=op, site=site, exp=int(time.time()) + DEFAULT_TTL_SECONDS)
+
+
+class TestOperationPayloadRoundTrip:
+    def test_sign_and_verify(self) -> None:
+        payload = _fresh_op_payload()
+        token = sign(payload, SECRET_A)
+        verified = verify_operation(
+            token, SECRET_A, expected_site=payload.site, expected_op=payload.op
+        )
+        assert verified.op == payload.op
+        assert verified.site == payload.site
+        assert verified.exp == payload.exp
+
+    def test_dataclass_is_frozen(self) -> None:
+        p = _fresh_op_payload()
+        with pytest.raises(Exception):  # FrozenInstanceError or AttributeError
+            p.op = "create_site"  # type: ignore[misc]
+
+
+class TestOperationRejection:
+    def test_wrong_op_rejected(self) -> None:
+        """A token minted for op=list_sites must NOT unlock op=create_site
+        even with otherwise-valid signature, site, and expiry. This is
+        the same cross-binding semantic as the confirm-token pattern in
+        the control plane."""
+        token = sign(_fresh_op_payload(op="list_sites"), SECRET_A)
+        with pytest.raises(TokenError) as ei:
+            verify_operation(
+                token, SECRET_A, expected_site="tenant.example.com", expected_op="create_site"
+            )
+        assert ei.value.reason == "wrong_op"
+
+    def test_wrong_site_rejected(self) -> None:
+        token = sign(_fresh_op_payload(site="alpha.example.com"), SECRET_A)
+        with pytest.raises(TokenError) as ei:
+            verify_operation(
+                token, SECRET_A, expected_site="beta.example.com", expected_op="list_sites"
+            )
+        assert ei.value.reason == "wrong_site"
+
+    def test_bad_signature_rejected(self) -> None:
+        token = sign(_fresh_op_payload(), SECRET_A)
+        with pytest.raises(TokenError) as ei:
+            verify_operation(
+                token, SECRET_B, expected_site="tenant.example.com", expected_op="list_sites"
+            )
+        assert ei.value.reason == "bad_signature"
+
+    def test_expired_token_rejected(self) -> None:
+        payload = OperationPayload(op="list_sites", site="t.example.com", exp=int(time.time()) - 5)
+        token = sign(payload, SECRET_A)
+        with pytest.raises(TokenError) as ei:
+            verify_operation(
+                token, SECRET_A, expected_site="t.example.com", expected_op="list_sites"
+            )
+        assert ei.value.reason == "expired"
+
+    def test_too_long_ttl_rejected(self) -> None:
+        far_future = OperationPayload(
+            op="list_sites",
+            site="t.example.com",
+            exp=int(time.time()) + MAX_TTL_SECONDS + 60,
+        )
+        token = sign(far_future, SECRET_A)
+        with pytest.raises(TokenError) as ei:
+            verify_operation(
+                token, SECRET_A, expected_site="t.example.com", expected_op="list_sites"
+            )
+        assert ei.value.reason == "too_long_ttl"
+
+    def test_malformed_token_rejected(self) -> None:
+        with pytest.raises(TokenError) as ei:
+            verify_operation(
+                "not-a-token-at-all", SECRET_A, expected_site="x", expected_op="list_sites"
+            )
+        assert ei.value.reason == "malformed"
+
+
+class TestPayloadShapeIsolation:
+    """LoginPayload and OperationPayload share the wire format. They
+    are NOT interchangeable. A LoginPayload token must NOT validate as
+    an OperationPayload and vice versa — even when the signature is
+    correct, site matches, expiry hasn't elapsed.
+
+    This is the security-property defense: an operator's
+    Login-as-Admin token cannot be replayed against a site-CRUD
+    endpoint to gain bench-level mutation power."""
+
+    def test_login_payload_rejected_by_verify_operation(self) -> None:
+        login_token = sign(
+            LoginPayload(
+                user="Administrator", site="t.example.com", exp=int(time.time()) + 30
+            ),
+            SECRET_A,
+        )
+        with pytest.raises(TokenError) as ei:
+            verify_operation(
+                login_token,
+                SECRET_A,
+                expected_site="t.example.com",
+                expected_op="list_sites",
+            )
+        assert ei.value.reason == "wrong_shape"
+
+    def test_operation_payload_rejected_by_verify(self) -> None:
+        op_token = sign(
+            OperationPayload(op="list_sites", site="t.example.com", exp=int(time.time()) + 30),
+            SECRET_A,
+        )
+        # `verify` (LoginPayload) lacks an explicit wrong_shape check —
+        # it falls through to "malformed" when ``user`` is missing. The
+        # property we care about is "doesn't validate", not the exact
+        # reason string.
+        with pytest.raises(TokenError):
+            verify(op_token, SECRET_A, expected_site="t.example.com")

@@ -1,31 +1,34 @@
-"""Whitelisted Frappe endpoint that consumes a signed login token.
+"""Whitelisted Frappe endpoints reachable from the SkyEngPro Cloud
+control plane.
 
-Reachable from outside the tenant pod at:
+Today the agent exposes:
 
-    https://<site>/api/method/skypaas_agent.api.login_via_token?token=<signed>
+  - ``login_via_token`` (PR-C, 0.1.0) — the Login-as-Admin signed-URL
+    endpoint per ADR-0013. Auth: ``LoginPayload`` HMAC token.
 
-Flow:
+  - ``list_sites`` (PR #1A, 0.2.0) — read-only listing of sites
+    hosted on this bench, used by the control plane's reconcile loop
+    per ADR-0017 §3.1 / §6.1. Auth: ``OperationPayload`` HMAC token
+    bound to ``op=list_sites``.
 
-  1. Read the per-tenant HMAC secret from this site's `site_config.json`
-     (`skypaas_agent_hmac_secret`, hex-encoded).
-  2. Verify the token (signature, expiry, site binding).
-  3. Call `frappe.local.login_manager.login_as(user)` to set the session
-     cookie. From this point the operator's browser is authenticated.
-  4. Redirect to /app (the Desk) or to the `next` query param if provided.
+Mutation endpoints (``create_site``, ``drop_site``, ``backup_site``,
+``restore_site``) and the job-poll endpoint land in PR #1B.
 
-Failures return a flat JSON error (not the Frappe HTML traceback) so the
-dashboard's caller can render a useful message.
+Every endpoint shares the same per-tenant HMAC secret from
+``site_config.json:skypaas_agent_hmac_secret``. Failures return flat
+JSON errors (never Frappe's HTML traceback) so the dashboard can
+render useful messages.
 
-Audit: every attempt — successful or not — is recorded as a
-``skypaas_agent_login`` Frappe activity log entry. The control plane is
-expected to ALSO emit its own ``credential.used`` event when it mints
-the token; this is the matching tenant-side breadcrumb so two
-independent timelines can be reconciled during an incident.
+Audit: every call — successful or not — is recorded as a
+``skypaas_agent_*`` Frappe activity log entry. The control plane
+ALSO emits its own event when it mints the token; the two timelines
+reconcile during incident review.
 """
 
 from __future__ import annotations
 
-from .tokens import TokenError, verify
+from . import bench_ops
+from .tokens import TokenError, verify, verify_operation
 
 
 def login_via_token(token: str = "", next: str = "/app"):  # noqa: A002 — Frappe-style kwarg name
@@ -82,3 +85,78 @@ def _audit(kind: str, **fields) -> None:
         )
     except Exception:
         pass
+
+
+# ---------- Phase 2 (ADR-0017) ----------
+
+
+def _load_secret() -> bytes | None:
+    """Read + decode the per-tenant HMAC secret from site_config.json.
+
+    Returns the bytes secret on success or ``None`` if the config is
+    missing / malformed (the caller emits an audit event and returns
+    500). Keeps the secret-loading logic in one place so the login and
+    operation endpoints don't drift.
+    """
+    import frappe  # noqa: PLC0415
+
+    secret_hex = frappe.local.conf.get("skypaas_agent_hmac_secret")
+    if not secret_hex:
+        return None
+    try:
+        return bytes.fromhex(secret_hex)
+    except ValueError:
+        return None
+
+
+def list_sites(token: str = ""):
+    """Return every Frappe site hosted on this bench.
+
+    Auth: HMAC ``OperationPayload`` with ``op="list_sites"``, bound to
+    this site's FQDN. The dashboard's reconcile loop calls this every
+    ~30s per ADR-0017 §6.1.
+
+    Response shape on success::
+
+        {
+            "ok": true,
+            "sites": ["acme-prod.homelab.local", "acme-staging.homelab.local"],
+            "duration_ms": 47
+        }
+
+    On rejection::
+
+        {"error": "invalid_token", "reason": "<enum>"}  # 401
+        {"error": "agent_misconfigured"}                # 500
+        {"error": "bench_failed", "stderr": "..."}      # 502 (bench CLI failed)
+    """
+    import frappe  # noqa: PLC0415
+
+    site = frappe.local.site
+
+    secret = _load_secret()
+    if secret is None:
+        _audit("list_sites.misconfigured", site=site, reason="hmac_secret_missing_or_not_hex")
+        frappe.local.response["http_status_code"] = 500
+        return {"error": "agent_misconfigured"}
+
+    try:
+        verify_operation(token, secret, expected_site=site, expected_op="list_sites")
+    except TokenError as e:
+        _audit("list_sites.rejected", site=site, reason=e.reason)
+        frappe.local.response["http_status_code"] = 401
+        return {"error": "invalid_token", "reason": e.reason}
+
+    result, sites = bench_ops.list_sites()
+    if not result.ok:
+        _audit(
+            "list_sites.bench_failed",
+            site=site,
+            exit_code=result.exit_code,
+            stderr=result.stderr[:500],
+        )
+        frappe.local.response["http_status_code"] = 502
+        return {"error": "bench_failed", "stderr": result.stderr.strip()[:500]}
+
+    _audit("list_sites.ok", site=site, count=len(sites), duration_ms=result.duration_ms)
+    return {"ok": True, "sites": sites, "duration_ms": result.duration_ms}
