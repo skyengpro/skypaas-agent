@@ -128,3 +128,161 @@ class TestFormatCmdForAudit:
         # when shell-parsed. We don't actually parse here; just confirm
         # the apostrophe got quoted somehow.
         assert "a'b" not in formatted or '"a\'b"' in formatted or "'a'\"'\"'b'" in formatted
+
+    def test_redacts_admin_password_two_arg_form(self) -> None:
+        formatted = format_cmd_for_audit(
+            ["bench", "new-site", "x.com", "--admin-password", "S3kret!"]
+        )
+        assert "S3kret!" not in formatted
+        assert "<REDACTED>" in formatted
+
+    def test_redacts_admin_password_equals_form(self) -> None:
+        formatted = format_cmd_for_audit(["bench", "new-site", "x.com", "--admin-password=hunter2"])
+        assert "hunter2" not in formatted
+        assert "--admin-password=<REDACTED>" in formatted
+
+    def test_redacts_mariadb_root_password(self) -> None:
+        formatted = format_cmd_for_audit(
+            ["bench", "new-site", "x.com", "--mariadb-root-password", "rootpw"]
+        )
+        assert "rootpw" not in formatted
+
+    def test_does_not_redact_other_args(self) -> None:
+        formatted = format_cmd_for_audit(
+            ["bench", "new-site", "acme.example.com", "--admin-email", "ops@example.com"]
+        )
+        assert "ops@example.com" in formatted
+        assert "acme.example.com" in formatted
+
+
+# ---------- PR #1B mutations ----------
+# (extra imports kept here rather than top-of-file for delta clarity;
+#  E402 silenced for the same reason)
+from skypaas_agent.bench_ops import (  # noqa: E402
+    backup_site,
+    create_site,
+    drop_site,
+    restore_site,
+)
+
+
+def _capturing_runner(seen: list[list[str]]):
+    """A runner that records each cmd it sees + returns a success process."""
+
+    def runner(cmd):
+        seen.append(list(cmd))
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    return runner
+
+
+class TestCreateSite:
+    def test_builds_correct_cmd(self) -> None:
+        seen: list[list[str]] = []
+        create_site(
+            "acme.homelab.local",
+            admin_email="ops@example.com",
+            admin_password="LongEnoughPw!23",
+            runner=_capturing_runner(seen),
+        )
+        assert seen == [
+            [
+                "bench",
+                "new-site",
+                "acme.homelab.local",
+                "--admin-email",
+                "ops@example.com",
+                "--admin-password",
+                "LongEnoughPw!23",
+                "--install-app",
+                "erpnext",
+            ]
+        ]
+
+    def test_multiple_install_apps(self) -> None:
+        seen: list[list[str]] = []
+        create_site(
+            "x.com",
+            admin_email="a@b.com",
+            admin_password="LongEnoughPw!23",
+            install_apps=("erpnext", "payments"),
+            runner=_capturing_runner(seen),
+        )
+        assert seen[0].count("--install-app") == 2
+        assert "payments" in seen[0]
+
+    def test_passes_mariadb_root_password_when_provided(self) -> None:
+        seen: list[list[str]] = []
+        create_site(
+            "x.com",
+            admin_email="a@b.com",
+            admin_password="LongEnoughPw!23",
+            mariadb_root_password="rootpw",
+            runner=_capturing_runner(seen),
+        )
+        assert "--mariadb-root-password" in seen[0]
+        assert "rootpw" in seen[0]
+
+    def test_propagates_failure(self) -> None:
+        runner = _make_runner(stderr="DB connection refused", returncode=1)
+        result = create_site(
+            "x.com",
+            admin_email="a@b.com",
+            admin_password="LongEnoughPw!23",
+            runner=runner,
+        )
+        assert result.ok is False
+        assert "DB connection refused" in result.stderr
+
+
+class TestDropSite:
+    def test_default_force_and_no_backup(self) -> None:
+        seen: list[list[str]] = []
+        drop_site("acme.homelab.local", runner=_capturing_runner(seen))
+        assert seen == [["bench", "drop-site", "acme.homelab.local", "--force", "--no-backup"]]
+
+    def test_omits_flags_when_disabled(self) -> None:
+        seen: list[list[str]] = []
+        drop_site("x.com", force=False, no_backup=False, runner=_capturing_runner(seen))
+        assert seen == [["bench", "drop-site", "x.com"]]
+
+
+class TestBackupSite:
+    def test_default_with_files(self) -> None:
+        seen: list[list[str]] = []
+        backup_site("acme.homelab.local", runner=_capturing_runner(seen))
+        assert seen == [["bench", "--site", "acme.homelab.local", "backup", "--with-files"]]
+
+    def test_db_only_when_disabled(self) -> None:
+        seen: list[list[str]] = []
+        backup_site("x.com", with_files=False, runner=_capturing_runner(seen))
+        assert seen == [["bench", "--site", "x.com", "backup"]]
+
+
+class TestRestoreSite:
+    def test_builds_minimal_cmd(self) -> None:
+        seen: list[list[str]] = []
+        restore_site("acme.homelab.local", "/tmp/backup.sql.gz", runner=_capturing_runner(seen))
+        assert seen == [["bench", "--site", "acme.homelab.local", "restore", "/tmp/backup.sql.gz"]]
+
+    def test_includes_file_tarballs_when_provided(self) -> None:
+        seen: list[list[str]] = []
+        restore_site(
+            "x.com",
+            "/db.sql.gz",
+            public_files_path="/public.tar",
+            private_files_path="/private.tar",
+            runner=_capturing_runner(seen),
+        )
+        assert "--with-public-files" in seen[0]
+        assert "/public.tar" in seen[0]
+        assert "--with-private-files" in seen[0]
+        assert "/private.tar" in seen[0]
+
+    def test_includes_admin_password_when_provided(self) -> None:
+        seen: list[list[str]] = []
+        restore_site(
+            "x.com", "/db.sql.gz", admin_password="ResetPw1234!", runner=_capturing_runner(seen)
+        )
+        assert "--admin-password" in seen[0]
+        assert "ResetPw1234!" in seen[0]
