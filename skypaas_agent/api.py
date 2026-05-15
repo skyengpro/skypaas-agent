@@ -301,6 +301,7 @@ def _enqueue_simple_job(op: str, site: str, work_method: str, **work_kwargs: Any
 # ---------- create_site ----------
 
 
+@_whitelist(allow_guest=True)
 def create_site(
     token: str = "",
     site_name: str = "",
@@ -379,6 +380,7 @@ def _run_create_site_job(
 # ---------- drop_site ----------
 
 
+@_whitelist(allow_guest=True)
 def drop_site(token: str = "", site_name: str = ""):
     """Tear down a Frappe site asynchronously.
 
@@ -414,6 +416,7 @@ def _run_drop_site_job(job_id: str, site_name: str) -> None:
 # ---------- backup_site ----------
 
 
+@_whitelist(allow_guest=True)
 def backup_site(token: str = "", site_name: str = "", with_files: str = "true"):
     """Run ``bench backup`` asynchronously.
 
@@ -452,6 +455,7 @@ def _run_backup_site_job(job_id: str, site_name: str, with_files: bool = True) -
 # ---------- restore_site ----------
 
 
+@_whitelist(allow_guest=True)
 def restore_site(
     token: str = "",
     site_name: str = "",
@@ -520,6 +524,7 @@ def _run_restore_site_job(
 # ---------- get_job ----------
 
 
+@_whitelist(allow_guest=True)
 def get_job(token: str = "", job_id: str = ""):
     """Return a job's current state.
 
