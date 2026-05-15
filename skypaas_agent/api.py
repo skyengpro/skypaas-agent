@@ -39,12 +39,27 @@ from typing import Any
 from . import bench_ops, jobs, locks
 from .tokens import TokenError, verify, verify_operation
 
+# Conditional whitelist decorator. In production, Frappe loads this
+# module after `import frappe` is already valid, so `frappe.whitelist`
+# is the real decorator. In unit tests, Frappe isn't on PYTHONPATH at
+# module-import time (test fixtures install a stub `frappe` into
+# sys.modules per-test). The fallback `_whitelist` is a no-op so the
+# module imports cleanly in both worlds; tests that exercise endpoint
+# behavior monkey-patch `frappe` AFTER import via sys.modules.
+try:
+    import frappe as _frappe_for_decorator  # noqa: PLC0415 — module-import time decorator
+    _whitelist = _frappe_for_decorator.whitelist
+except (ImportError, AttributeError):
+    def _whitelist(**_kwargs):
+        return lambda f: f
 
+
+@_whitelist(allow_guest=True)
 def login_via_token(token: str = "", next: str = "/app"):  # noqa: A002 — Frappe-style kwarg name
-    """The whitelisted endpoint. Frappe sets allow_guest=True via the
-    decorator below at runtime (frappe.whitelist is monkey-patched at
-    import-time; we keep the body framework-agnostic so it's unit-testable
-    without a Frappe runtime)."""
+    """The whitelisted endpoint. `@_whitelist(allow_guest=True)` above
+    is `frappe.whitelist` in production and a no-op in tests. The body
+    verifies the HMAC token + maps the embedded user identity to a
+    Frappe session via `login_manager.login_as`."""
     import frappe  # noqa: PLC0415 — imported lazily so unit tests can stub
 
     site = frappe.local.site
@@ -118,6 +133,7 @@ def _load_secret() -> bytes | None:
         return None
 
 
+@_whitelist(allow_guest=True)
 def list_sites(token: str = ""):
     """Return every Frappe site hosted on this bench.
 
